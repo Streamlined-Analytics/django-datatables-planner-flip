@@ -1,0 +1,4 @@
+Django==6.0.6
+djangorestframework==3.17.1
+djangorestframework-datatables==0.7.2
+psycopg[binary]==3.3.4
