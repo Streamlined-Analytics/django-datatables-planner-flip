@@ -6,24 +6,6 @@ search, the slower it gets. The bug path is entirely stock code:
 [`djangorestframework-datatables`](https://github.com/izimobil/django-rest-framework-datatables) 0.7.2,
 Django 6.0.6, PostgreSQL 18 with `pg_trgm`.
 
-## Mechanism
-
-1. `DatatablesFilterBackend` computes the filtered count first (cheap — no
-   `ORDER BY`, so it uses the trigram index) and stores it on the view.
-2. `DatatablesPageNumberPagination` feeds it into a `CachedCountPaginator`, and
-   `django.core.paginator.Paginator.page()` clamps the slice: with 7 matches
-   and a requested page length of 25, `top + orphans >= count` fires and the
-   page query runs with `LIMIT 7` instead of `LIMIT 25`.
-3. Postgres estimates ~1,000 matches for the `%substring%` pattern (actual: 7),
-   assumes it can walk the ordering btree and stop after `7/1000` of it, prices
-   that walk below the trigram bitmap plan — and walks, filtering out millions
-   of rows to find the 7 matches.
-
-The cheap count sets the `LIMIT`, and the `LIMIT` selects the plan. No single
-component is wrong: the clamp, the cached count, and the abort-early costing
-are each reasonable — they compose into the pathology, and it inverts: the
-rarer the term, the smaller the `LIMIT`, the cheaper the walk looks.
-
 ## Reproduce
 
 Requires Docker. The seed loads 10M rows (~2 GB, a few minutes) — the size is
@@ -69,6 +51,24 @@ DEBUG django.db.backends (32.162) SELECT DISTINCT ... ORDER BY "people_person"."
 (the stock filter backend adds `DISTINCT` to searched querysets; it doesn't
 affect the plan choice), and `docker compose logs db` has the full plan via
 `auto_explain`.
+
+## Mechanism
+
+1. `DatatablesFilterBackend` computes the filtered count first (cheap — no
+   `ORDER BY`, so it uses the trigram index) and stores it on the view.
+2. `DatatablesPageNumberPagination` feeds it into a `CachedCountPaginator`, and
+   `django.core.paginator.Paginator.page()` clamps the slice: with 7 matches
+   and a requested page length of 25, `top + orphans >= count` fires and the
+   page query runs with `LIMIT 7` instead of `LIMIT 25`.
+3. Postgres estimates ~1,000 matches for the `%substring%` pattern (actual: 7),
+   assumes it can walk the ordering btree and stop after `7/1000` of it, prices
+   that walk below the trigram bitmap plan — and walks, filtering out millions
+   of rows to find the 7 matches.
+
+The cheap count sets the `LIMIT`, and the `LIMIT` selects the plan. No single
+component is wrong: the clamp, the cached count, and the abort-early costing
+are each reasonable — they compose into the pathology, and it inverts: the
+rarer the term, the smaller the `LIMIT`, the cheaper the walk looks.
 
 ## Notes
 
