@@ -28,13 +28,13 @@ catastrophic walk looks.
 
 ## Reproduce it
 
-Requires Docker. The seed creates ~20M rows (a few GB in the `pgdata` volume,
-several minutes to load):
+Requires Docker. The seed creates ~10M rows (~2 GB in the `pgdata` volume, a
+few minutes to load):
 
 ```bash
 docker compose up -d --build
 docker compose run --rm web python manage.py migrate
-docker compose run --rm web python manage.py seed_people        # ~20M rows, takes a while
+docker compose run --rm web python manage.py seed_people        # ~10M rows, a few minutes
 docker compose run --rm web python manage.py demonstrate_flip   # the proof, no browser needed
 ```
 
@@ -45,36 +45,39 @@ the two queries):
 
 ```
 === LIMIT 7 ===    <- the clamped LIMIT the paginator actually emits
-Limit  (cost=0.44..3563.06 rows=7) (actual time=59323.994..59323.997 rows=7.00)
+Limit  (cost=0.43..3566.07 rows=7) (actual time=25826.546..25826.549 rows=7.00)
   ->  Index Scan using person_full_name_idx on people_person
-          (cost=0.44..1010766.80 rows=1986)
+          (cost=0.43..505811.11 rows=993)
         Filter: (upper((full_name)::text) ~~ '%RONALD QUIBBLE%'::text)
-        Rows Removed by Filter: 16952382
-Execution Time: 59324.033 ms
+        Rows Removed by Filter: 8476192
+Execution Time: 25826.587 ms
 
 === LIMIT 25 ===   <- the LIMIT the client requested
-Limit  (cost=10072.95..10073.01 rows=25) (actual time=6.276..6.277 rows=7.00)
+Limit  (cost=5110.48..5110.54 rows=25) (actual time=0.459..0.459 rows=7.00)
   ->  Sort (Sort Key: full_name)
-        ->  Bitmap Heap Scan on people_person  (cost=2814.93..10016.90 rows=1986)
+        ->  Bitmap Heap Scan on people_person  (cost=1481.47..5082.46 rows=993)
               ->  Bitmap Index Scan on person_full_name_trgm_idx
-Execution Time: 6.347 ms
+Execution Time: 0.528 ms
 ```
 
-**59 seconds versus 6 milliseconds, 16.9M rows discarded to return 7** —
-faithfully mirroring the production incident (26 s vs 72 ms on 21.8M rows, with
-near-identical planner arithmetic: walk-with-LIMIT cost 3,563 here vs 3,558 in
-production, row estimate 1,986 vs 2,174).
+**26 seconds versus half a millisecond, 8.5M rows discarded to return 7** —
+faithfully mirroring the production incident (26 s vs 72 ms on 21.8M rows), with
+the same planner arithmetic: walk-with-LIMIT cost 3,566 here vs 3,558 in
+production. Seeding at production scale (`seed_people --rows 20000000`)
+reproduces the production numbers almost exactly (row estimate 1,986 vs prod's
+2,174; 16.9M rows discarded vs 17.5M; 59 s cold).
 
 Then see it end-to-end in the browser at <http://localhost:8000> (set
 `WEB_PORT` to remap): search **`ronald quibble`** (the rare seeded name — 7
-matches) and the request stalls for a minute; search a common surname like
-`anderson` (140k matches) and it returns in about a second. That inversion —
+matches) and the request stalls for ~30 seconds; search a common surname like
+`anderson` (tens of thousands of matches) and it returns in about a second.
+That inversion —
 *more specific = catastrophically slower* — is the defining symptom. While the
 rare search stalls, the web container log shows the smoking gun, in order:
 
 ```
 INFO people.pagination pagination clamp: client requested length=25, filtered count=7 -> page query will run with LIMIT 7
-DEBUG django.db.backends (63.397) SELECT DISTINCT ... ORDER BY "people_person"."full_name" ASC LIMIT 7
+DEBUG django.db.backends (32.162) SELECT DISTINCT ... ORDER BY "people_person"."full_name" ASC LIMIT 7
 ```
 
 (The runtime SQL has a `DISTINCT` the `demonstrate_flip` query omits — the
@@ -128,9 +131,14 @@ Note the flip is scale-dependent in an interesting way: the walk-with-LIMIT
 cost is *nearly constant* as the table grows (walk cost and row estimate both
 scale linearly with table size, so they cancel — ~3,585 at 5M rows, ~3,563 at
 20M), while the bitmap plan's cost grows with table size (~2,620 at 5M rows,
-~10,073 at 20M). At 5M rows the bitmap plan still wins and there is no bug;
-somewhere before 20M the costs cross and the planner flips. That is why this
-repo seeds 20M rows.
+~10,073 at 20M). Bisecting on this seed's name distribution, the costs cross
+**between 6.5M and 7M rows**: at 6.5M the bitmap plan wins by ~6% (3,347 vs
+~3,565) and there is no bug; at 7M the walk wins by under 1% and the query
+takes 17 s. Right at the threshold the choice is a knife edge that ANALYZE
+sampling noise could tip either way, so this repo seeds **10M rows** by
+default — a ~43% cost margin (5,110 vs 3,566) that flips reliably while
+keeping the seed reasonably small. `--rows 20000000` reproduces the incident
+at production scale.
 
 ## The fix we shipped (not included here — this repo is the bug, minimal)
 
@@ -163,6 +171,6 @@ threshold (10,000), and the gating count is itself capped with `LIMIT N+1`.
 | `people/views.py`, `serializers.py` | stock DRF `ReadOnlyModelViewSet` |
 | `people/pagination.py` | stock pagination + the clamp log line |
 | `people/templates/people/directory.html` | server-side DataTables 1.13.4 frontend |
-| `people/management/commands/seed_people.py` | bulk seed (~20M generated names + 7 × the rare name) |
+| `people/management/commands/seed_people.py` | bulk seed (~10M generated names + 7 × the rare name) |
 | `people/management/commands/demonstrate_flip.py` | `EXPLAIN ANALYZE` at both LIMITs |
 | `compose.yml` | `postgres:18` with `auto_explain`, Django dev server |

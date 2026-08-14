@@ -44,7 +44,7 @@ class Command(BaseCommand):
     )
 
     def add_arguments(self, parser):
-        parser.add_argument("--rows", type=int, default=20_000_000)
+        parser.add_argument("--rows", type=int, default=10_000_000)
         parser.add_argument("--rare-name", default="Ronald Quibble")
         parser.add_argument("--rare-count", type=int, default=7)
 
