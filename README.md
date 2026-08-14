@@ -1,50 +1,45 @@
 # DataTables pagination clamp → catastrophic Postgres plan flip
 
-A minimal reproduction of a production incident: a server-side DataTables name
-search that takes **tens of seconds for rare search terms** and **milliseconds
-for common ones** — the more specific the search, the slower it gets.
+A server-side DataTables name search that takes **tens of seconds for rare
+search terms** and **milliseconds for common ones** — the more specific the
+search, the slower it gets. The bug path is entirely stock code:
+[`djangorestframework-datatables`](https://github.com/izimobil/django-rest-framework-datatables) 0.7.2,
+Django 6.0.6, PostgreSQL 18 with `pg_trgm`.
 
-No custom pagination or filtering code is involved. The entire bug path is:
+## Mechanism
 
-- [`djangorestframework-datatables`](https://github.com/izimobil/django-rest-framework-datatables) 0.7.2 (stock `DatatablesFilterBackend` + `DatatablesPageNumberPagination`)
-- Django 6.0.6 (`django.core.paginator.Paginator.page()`)
-- PostgreSQL 18 with `pg_trgm`
+1. `DatatablesFilterBackend` computes the filtered count first (cheap — no
+   `ORDER BY`, so it uses the trigram index) and stores it on the view.
+2. `DatatablesPageNumberPagination` feeds it into a `CachedCountPaginator`, and
+   `django.core.paginator.Paginator.page()` clamps the slice: with 7 matches
+   and a requested page length of 25, `top + orphans >= count` fires and the
+   page query runs with `LIMIT 7` instead of `LIMIT 25`.
+3. Postgres estimates ~1,000 matches for the `%substring%` pattern (actual: 7),
+   assumes it can walk the ordering btree and stop after `7/1000` of it, prices
+   that walk below the trigram bitmap plan — and walks, filtering out millions
+   of rows to find the 7 matches.
 
-## The mechanism in one paragraph
+The cheap count sets the `LIMIT`, and the `LIMIT` selects the plan. No single
+component is wrong: the clamp, the cached count, and the abort-early costing
+are each reasonable — they compose into the pathology, and it inverts: the
+rarer the term, the smaller the `LIMIT`, the cheaper the walk looks.
 
-The DataTables filter backend computes the **filtered count first** (cheap — it
-has no `ORDER BY`, so it uses the trigram index). The pagination class feeds
-that count into a `CachedCountPaginator`, and `Paginator.page()` **clamps the
-page slice to the count**: with 7 matches and a requested page length of 25,
-`top + orphans >= count` fires and the slice becomes `object_list[0:7]` — i.e.
-`LIMIT 7`. That small `LIMIT` is what makes the Postgres planner abandon the
-trigram index: it estimates ~2,000 matches for the pattern (actual: 7), assumes
-it can walk the ordering btree and stop after `7/2000` of it, prices that walk
-below the trigram bitmap plan, and then walks — filtering and discarding
-**millions of rows** to find the 7 matches. The cheap count sets the `LIMIT`,
-and the `LIMIT` selects the plan. The failure is *inverted*: the rarer the
-name, the smaller the count, the smaller the `LIMIT`, the cheaper the
-catastrophic walk looks.
+## Reproduce
 
-## Reproduce it
-
-Requires Docker. The seed creates ~10M rows (~2 GB in the `pgdata` volume, a
-few minutes to load):
+Requires Docker. The seed loads ~10M rows (~2 GB, a few minutes):
 
 ```bash
 docker compose up -d --build
 docker compose run --rm web python manage.py migrate
-docker compose run --rm web python manage.py seed_people        # ~10M rows, a few minutes
-docker compose run --rm web python manage.py demonstrate_flip   # the proof, no browser needed
+docker compose run --rm web python manage.py seed_people
+docker compose run --rm web python manage.py demonstrate_flip
 ```
 
-`demonstrate_flip` runs the exact page query under `EXPLAIN (ANALYZE, BUFFERS)`
-at `LIMIT 7` (what the clamp produces) and `LIMIT 25` (what the client asked
-for). Actual captured output from this repo (only the `LIMIT` differs between
-the two queries):
+`demonstrate_flip` runs the page query under `EXPLAIN (ANALYZE, BUFFERS)` at
+both LIMITs. Captured output — only the `LIMIT` differs:
 
 ```
-=== LIMIT 7 ===    <- the clamped LIMIT the paginator actually emits
+=== LIMIT 7 ===    <- what the clamp emits
 Limit  (cost=0.43..3566.07 rows=7) (actual time=25826.546..25826.549 rows=7.00)
   ->  Index Scan using person_full_name_idx on people_person
           (cost=0.43..505811.11 rows=993)
@@ -52,7 +47,7 @@ Limit  (cost=0.43..3566.07 rows=7) (actual time=25826.546..25826.549 rows=7.00)
         Rows Removed by Filter: 8476192
 Execution Time: 25826.587 ms
 
-=== LIMIT 25 ===   <- the LIMIT the client requested
+=== LIMIT 25 ===   <- what the client requested
 Limit  (cost=5110.48..5110.54 rows=25) (actual time=0.459..0.459 rows=7.00)
   ->  Sort (Sort Key: full_name)
         ->  Bitmap Heap Scan on people_person  (cost=1481.47..5082.46 rows=993)
@@ -60,117 +55,35 @@ Limit  (cost=5110.48..5110.54 rows=25) (actual time=0.459..0.459 rows=7.00)
 Execution Time: 0.528 ms
 ```
 
-**26 seconds versus half a millisecond, 8.5M rows discarded to return 7** —
-faithfully mirroring the production incident (26 s vs 72 ms on 21.8M rows), with
-the same planner arithmetic: walk-with-LIMIT cost 3,566 here vs 3,558 in
-production. Seeding at production scale (`seed_people --rows 20000000`)
-reproduces the production numbers almost exactly (row estimate 1,986 vs prod's
-2,174; 16.9M rows discarded vs 17.5M; 59 s cold).
-
-Then see it end-to-end in the browser at <http://localhost:8000> (set
-`WEB_PORT` to remap): search **`ronald quibble`** (the rare seeded name — 7
-matches) and the request stalls for ~30 seconds; search a common surname like
-`anderson` (tens of thousands of matches) and it returns in about a second.
-That inversion —
-*more specific = catastrophically slower* — is the defining symptom. While the
-rare search stalls, the web container log shows the smoking gun, in order:
+End-to-end: open <http://localhost:8000> (set `WEB_PORT` to remap), search
+**`ronald quibble`** (the rare seeded name, 7 matches) and the request stalls
+~30 s; search `anderson` and it returns in ~1 s. The web log shows the clamp:
 
 ```
 INFO people.pagination pagination clamp: client requested length=25, filtered count=7 -> page query will run with LIMIT 7
 DEBUG django.db.backends (32.162) SELECT DISTINCT ... ORDER BY "people_person"."full_name" ASC LIMIT 7
 ```
 
-(The runtime SQL has a `DISTINCT` the `demonstrate_flip` query omits — the
-stock filter backend adds `.distinct()` to searched querysets. It does not
-change the plan choice; the walk underneath is identical.)
+(the stock filter backend adds `DISTINCT` to searched querysets; it doesn't
+affect the plan choice), and `docker compose logs db` has the full plan via
+`auto_explain`.
 
-and `docker compose logs db` shows the full catastrophic plan, captured by
-`auto_explain` (enabled in `compose.yml` exactly as it was used to capture the
-production incident).
+## Notes
 
-## Where the LIMIT comes from — the code path
+- **Scale threshold:** the walk-with-LIMIT cost is nearly constant as the table
+  grows (walk cost and row estimate both scale linearly, so they cancel), while
+  the bitmap plan's cost grows with table size. On this seed the plans cross
+  between 6.5M and 7M rows — a knife edge there, so the default is 10M for a
+  ~43% cost margin. `--rows 20000000` mirrors the production incident this repo
+  was distilled from (21.8M rows, 26 s vs 72 ms).
+- Any query with this shape and a small `LIMIT` (`.first()`, a "top 5" widget)
+  hits the same flip — DataTables is just the delivery mechanism for the
+  count-derived `LIMIT`.
 
-1. `rest_framework_datatables.filters.DatatablesFilterBackend` runs the
-   filtered `COUNT(*)` and stores it on the view
-   (`view._datatables_filtered_count`).
-2. `rest_framework_datatables.pagination.DatatablesPageNumberPagination.paginate_queryset`
-   reads it back in `get_count_and_total_count()` and builds a
-   `CachedCountPaginator` whose `count` property returns the precomputed value —
-   [pagination.py](https://github.com/izimobil/django-rest-framework-datatables/blob/master/rest_framework_datatables/pagination.py).
-3. `django.core.paginator.Paginator.page()` clamps the slice —
-   [paginator.py](https://github.com/django/django/blob/main/django/core/paginator.py):
+## Layout
 
-   ```python
-   bottom = (number - 1) * self.per_page
-   top = bottom + self.per_page
-   if top + self.orphans >= self.count:   # 25 >= 7
-       top = self.count                    # top = 7
-   return self._get_page(self.object_list[bottom:top], number, self)
-   ```
-
-   `object_list[0:7]` → `LIMIT 7`.
-
-None of this is wrong in isolation. The clamp is a reasonable micro-optimisation,
-the cached count avoids a second `COUNT(*)`, and the planner's abort-early
-arithmetic is sound *if its row estimate is right*. The estimate is ~300× off
-(`patternsel` for `%substring%` patterns has almost nothing to go on), and the
-three pieces compose into a 26-second query.
-
-## The planner arithmetic (production numbers)
-
-On the production table (21.8M rows) the planner estimated **2,174** matches
-for the search pattern; the true count was **7**.
-
-| | cost | outcome |
-|---|---|---|
-| Full walk of the ordering btree | 1,105,137 | — |
-| Walk with `LIMIT 7` (assumes stop after 7/2174) | 1,105,137 × 7/2174 ≈ **3,558** | chosen — 26,182 ms, 17.5M rows discarded |
-| Trigram bitmap plan | **4,096** | rejected — 72 ms when forced via `LIMIT 25` |
-
-Note the flip is scale-dependent in an interesting way: the walk-with-LIMIT
-cost is *nearly constant* as the table grows (walk cost and row estimate both
-scale linearly with table size, so they cancel — ~3,585 at 5M rows, ~3,563 at
-20M), while the bitmap plan's cost grows with table size (~2,620 at 5M rows,
-~10,073 at 20M). Bisecting on this seed's name distribution, the costs cross
-**between 6.5M and 7M rows**: at 6.5M the bitmap plan wins by ~6% (3,347 vs
-~3,565) and there is no bug; at 7M the walk wins by under 1% and the query
-takes 17 s. Right at the threshold the choice is a knife edge that ANALYZE
-sampling noise could tip either way, so this repo seeds **10M rows** by
-default — a ~43% cost margin (5,110 vs 3,566) that flips reliably while
-keeping the seed reasonably small. `--rows 20000000` reproduces the incident
-at production scale.
-
-## The fix we shipped (not included here — this repo is the bug, minimal)
-
-A **count-gated optimisation fence**: when the match count is small (the regime
-where the clamp produces a dangerous `LIMIT`), the filter is rewritten as
-`pk IN (WITH matches AS MATERIALIZED (SELECT id FROM ... WHERE name LIKE ...) SELECT pk FROM matches)`
-— the `MATERIALIZED` CTE is an optimisation barrier, so the trigram lookup can
-no longer be traded away against the ordering btree. The gate matters:
-fencing *unconditionally* moves the pain to broad terms (a two-letter search
-went 102 ms → 23,607 ms fenced), so the fence only applies below a match-count
-threshold (10,000), and the gating count is itself capped with `LIMIT N+1`.
-
-## Open questions
-
-- Is `Paginator.page()`'s clamp — turning a cheap count into a plan-selecting
-  `LIMIT` — a known footgun with large tables? It seems like a general
-  Django-plus-Postgres trap, not specific to DataTables.
-- Is there anything to do about `patternsel` being ~300× off for
-  `%substring%` patterns, or is "don't let the planner have the choice" the
-  only real answer?
-- Is there a cleaner idiom than the count-gated fence? (Considered and
-  rejected: `text_pattern_ops`/covering indexes, `SET LOCAL enable_indexscan`,
-  extended statistics — which don't help `LIKE` — and sorting on a surrogate.)
-
-## Repo layout
-
-| file | role |
-|---|---|
-| `people/models.py` | one model, one field, the two competing indexes |
-| `people/views.py`, `serializers.py` | stock DRF `ReadOnlyModelViewSet` |
-| `people/pagination.py` | stock pagination + the clamp log line |
-| `people/templates/people/directory.html` | server-side DataTables 1.13.4 frontend |
-| `people/management/commands/seed_people.py` | bulk seed (~10M generated names + 7 × the rare name) |
-| `people/management/commands/demonstrate_flip.py` | `EXPLAIN ANALYZE` at both LIMITs |
-| `compose.yml` | `postgres:18` with `auto_explain`, Django dev server |
+One model (`people/models.py`: `full_name` plus the btree ordering index and
+the trigram search index), a stock DRF `ReadOnlyModelViewSet`, the default
+drf-datatables pagination subclassed only to log the clamp
+(`people/pagination.py`), a DataTables 1.13.4 frontend, and the two management
+commands.
