@@ -26,7 +26,9 @@ rarer the term, the smaller the `LIMIT`, the cheaper the walk looks.
 
 ## Reproduce
 
-Requires Docker. The seed loads ~10M rows (~2 GB, a few minutes):
+Requires Docker. The seed loads 10M rows (~2 GB, a few minutes) — the size is
+deliberate: the bug does not reproduce below ~7M rows (see
+[Notes](#notes)):
 
 ```bash
 docker compose up -d --build
