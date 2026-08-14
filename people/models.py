@@ -9,7 +9,7 @@ class Person(models.Model):
     The two indexes are the two competing plans:
 
     - ``person_full_name_idx`` (btree) serves ``ORDER BY full_name`` and is the
-      index the planner walks in the catastrophic abort-early plan.
+      index the planner walks in the slow abort-early plan.
     - ``person_full_name_trgm_idx`` (GIN trigram on ``UPPER(full_name)``) serves
       ``full_name__icontains`` and is the index the planner *should* use.
     """

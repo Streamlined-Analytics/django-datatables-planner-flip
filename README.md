@@ -1,4 +1,4 @@
-# DataTables pagination clamp → catastrophic Postgres plan flip
+# DataTables pagination clamp → Postgres plan flip
 
 A server-side DataTables name search that takes **tens of seconds for rare
 search terms** and **milliseconds for common ones** — the more specific the
