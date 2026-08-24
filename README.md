@@ -70,14 +70,37 @@ component is wrong: the clamp, the cached count, and the abort-early costing
 are each reasonable — they compose into the pathology, and it inverts: the
 rarer the term, the smaller the `LIMIT`, the cheaper the walk looks.
 
+## Behaviour by table size
+
+Measured by reseeding at each size (`seed_people --rows N`, which re-runs
+`ANALYZE`) and running `demonstrate_flip`. At the requested `LIMIT 25` the
+planner picks the trigram bitmap scan at every size (0.3–0.8 ms throughout).
+The clamped `LIMIT 7` flips between 6.5M and 7M rows:
+
+| Rows       | Index used at `LIMIT 7`                 | Execution time | Rows removed by filter |
+|-----------:|-----------------------------------------|---------------:|-----------------------:|
+|  1,000,000 | `person_full_name_trgm_idx` (bitmap)    |         0.5 ms |                       — |
+|  5,000,000 | `person_full_name_trgm_idx` (bitmap)    |         0.5 ms |                       — |
+|  6,000,000 | `person_full_name_trgm_idx` (bitmap)    |         0.8 ms |                       — |
+|  6,500,000 | `person_full_name_trgm_idx` (bitmap)    |         0.6 ms |                       — |
+|  7,000,000 | `person_full_name_idx` (btree walk)     |         18.1 s |               5,933,336 |
+|  8,000,000 | `person_full_name_idx` (btree walk)     |         20.9 s |               6,780,952 |
+| 10,000,000 | `person_full_name_idx` (btree walk)     |         27.5 s |               8,476,192 |
+| 20,000,000 | `person_full_name_idx` (btree walk)     |         60.5 s |              16,952,382 |
+
+Past the flip the walk's runtime grows linearly with the table — it scans the
+ordering btree up to where the rare name sorts (~85% of the table on this
+seed) to find the 7 matches — while the bitmap plan stays sub-millisecond at
+every size.
+
 ## Notes
 
 - **Scale threshold:** the walk-with-LIMIT cost is nearly constant as the table
   grows (walk cost and row estimate both scale linearly, so they cancel), while
   the bitmap plan's cost grows with table size. On this seed the plans cross
-  between 6.5M and 7M rows — a knife edge there, so the default is 10M for a
-  ~43% cost margin. `--rows 20000000` mirrors the production incident this repo
-  was distilled from (21.8M rows, 26 s vs 72 ms).
+  between 6.5M and 7M rows (the table above) — a knife edge there, so the
+  default is 10M for a ~43% cost margin. `--rows 20000000` mirrors the
+  production incident this repo was distilled from (21.8M rows, 26 s vs 72 ms).
 - Any query with this shape and a small `LIMIT` (`.first()`, a "top 5" widget)
   hits the same flip — DataTables is just the delivery mechanism for the
   count-derived `LIMIT`.
