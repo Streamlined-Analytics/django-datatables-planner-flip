@@ -6,6 +6,30 @@ search, the slower it gets. The bug path is entirely stock code:
 [`djangorestframework-datatables`](https://github.com/izimobil/django-rest-framework-datatables) 0.7.2,
 Django 6.0.6, PostgreSQL 18 with `pg_trgm`.
 
+## Behaviour by table size
+
+Measured by reseeding at each size (`seed_people --rows N`, which re-runs
+`ANALYZE`) and running `demonstrate_flip` — both covered in
+[Reproduce](#reproduce). At the requested `LIMIT 25` the planner picks the
+trigram bitmap scan at every size (0.3–0.8 ms throughout). The clamped
+`LIMIT 7` flips between 6.5M and 7M rows:
+
+| Rows       | Index used at `LIMIT 7`                 | Execution time | Rows removed by filter |
+|-----------:|-----------------------------------------|---------------:|-----------------------:|
+|  1,000,000 | `person_full_name_trgm_idx` (bitmap)    |         0.5 ms |                       — |
+|  5,000,000 | `person_full_name_trgm_idx` (bitmap)    |         0.5 ms |                       — |
+|  6,000,000 | `person_full_name_trgm_idx` (bitmap)    |         0.8 ms |                       — |
+|  6,500,000 | `person_full_name_trgm_idx` (bitmap)    |         0.6 ms |                       — |
+|  7,000,000 | `person_full_name_idx` (btree walk)     |         18.1 s |               5,933,336 |
+|  8,000,000 | `person_full_name_idx` (btree walk)     |         20.9 s |               6,780,952 |
+| 10,000,000 | `person_full_name_idx` (btree walk)     |         27.5 s |               8,476,192 |
+| 20,000,000 | `person_full_name_idx` (btree walk)     |         60.5 s |              16,952,382 |
+
+Past the flip the walk's runtime grows linearly with the table — it scans the
+ordering btree up to where the rare name sorts (~85% of the table on this
+seed) to find the 7 matches — while the bitmap plan stays sub-millisecond at
+every size.
+
 ## Reproduce
 
 Requires Docker. The seed loads 10M rows (~2 GB, a few minutes) — the size is
@@ -69,29 +93,6 @@ The cheap count sets the `LIMIT`, and the `LIMIT` selects the plan. No single
 component is wrong: the clamp, the cached count, and the abort-early costing
 are each reasonable — they compose into the pathology, and it inverts: the
 rarer the term, the smaller the `LIMIT`, the cheaper the walk looks.
-
-## Behaviour by table size
-
-Measured by reseeding at each size (`seed_people --rows N`, which re-runs
-`ANALYZE`) and running `demonstrate_flip`. At the requested `LIMIT 25` the
-planner picks the trigram bitmap scan at every size (0.3–0.8 ms throughout).
-The clamped `LIMIT 7` flips between 6.5M and 7M rows:
-
-| Rows       | Index used at `LIMIT 7`                 | Execution time | Rows removed by filter |
-|-----------:|-----------------------------------------|---------------:|-----------------------:|
-|  1,000,000 | `person_full_name_trgm_idx` (bitmap)    |         0.5 ms |                       — |
-|  5,000,000 | `person_full_name_trgm_idx` (bitmap)    |         0.5 ms |                       — |
-|  6,000,000 | `person_full_name_trgm_idx` (bitmap)    |         0.8 ms |                       — |
-|  6,500,000 | `person_full_name_trgm_idx` (bitmap)    |         0.6 ms |                       — |
-|  7,000,000 | `person_full_name_idx` (btree walk)     |         18.1 s |               5,933,336 |
-|  8,000,000 | `person_full_name_idx` (btree walk)     |         20.9 s |               6,780,952 |
-| 10,000,000 | `person_full_name_idx` (btree walk)     |         27.5 s |               8,476,192 |
-| 20,000,000 | `person_full_name_idx` (btree walk)     |         60.5 s |              16,952,382 |
-
-Past the flip the walk's runtime grows linearly with the table — it scans the
-ordering btree up to where the rare name sorts (~85% of the table on this
-seed) to find the 7 matches — while the bitmap plan stays sub-millisecond at
-every size.
 
 ## Notes
 
